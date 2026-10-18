@@ -10,6 +10,25 @@ set -a; . ./.env 2>/dev/null || true; set +a
 
 SECGW="${SECGW_URL:-http://100.66.108.118:8783}"
 CFGW="${CFGW_URL:-http://100.66.108.118:8782}"
+BOOT_ATTEMPTS="${SSO_BOOT_ATTEMPTS:-15}"
+BOOT_RETRY_DELAY="${SSO_BOOT_RETRY_DELAY:-2}"
+
+wait_for_gateway() {  # $1=label $2=health URL
+  local label="$1" url="$2" attempt=1
+  while [ "$attempt" -le "$BOOT_ATTEMPTS" ]; do
+    if curl -fsS -m 2 "$url" >/dev/null 2>&1; then
+      [ "$attempt" -eq 1 ] || echo "sso-cfg: $label готов (попытка $attempt)" >&2
+      return 0
+    fi
+    if [ "$attempt" -lt "$BOOT_ATTEMPTS" ]; then
+      echo "sso-cfg: ждём $label ($attempt/$BOOT_ATTEMPTS)" >&2
+      sleep "$BOOT_RETRY_DELAY"
+    fi
+    attempt=$((attempt + 1))
+  done
+  echo "FATAL: $label не готов после $BOOT_ATTEMPTS попыток" >&2
+  return 1
+}
 
 # serg/tasks#1108: bearer шлюза — ЛИЧНЫЙ токен vps-sso (LoadCredential=secgw-token; scope VPS_SSO_*,
 # INFGW_ASSERT_KEY, CONFIG_STORE_TOKEN). Раньше здесь был root-шим Bitwarden (bws + bitwarden-sm.env)
@@ -22,7 +41,13 @@ else
   echo "sso-cfg: личный токен secgw недоступен — только .env-фолбэк" >&2
 fi
 
-_val() { python3 -c "import sys,json;print(json.load(sys.stdin).get('value') or '')"; }
+if [ -n "$MT" ]; then
+  wait_for_gateway secrets-gateway "$SECGW/health"
+fi
+
+_val() {
+  python3 -c 'import sys,json; v=json.load(sys.stdin).get("value"); print(json.dumps(v,separators=(",",":")) if isinstance(v,(dict,list)) else (v or ""))'
+}
 
 fetch_secret() {  # $1=key → эхо значение или пусто
   [ -n "$MT" ] || return 0
@@ -43,6 +68,9 @@ set_from() {  # $1=VAR $2=value $3=source — не перезаписываем 
 # 1) токен config-store — из secrets-gateway (бутстрап по MESH_TOKEN)
 CST=$(fetch_secret CONFIG_STORE_TOKEN_VPS_SSO); [ -n "$CST" ] && export CONFIG_STORE_TOKEN="$CST"
 export CONFIG_STORE_URL="$CFGW"
+if [ -n "${CONFIG_STORE_TOKEN:-}" ]; then
+  wait_for_gateway config-store "$CFGW/health"
+fi
 
 # 2) секреты приложения — из secrets-gateway (в security store — токены приложений)
 set_from JWT_SECRET       "$(fetch_secret VPS_SSO_JWT_SECRET)"       secrets-gateway
@@ -99,8 +127,8 @@ fi
 # = { "<host>": "<secretName>" }; значения — в secrets-gateway под этими именами.
 # Собираем SSO_INTERNAL_SECRETS = { "<host>": "<value>" }: у каждого сайта свой
 # секрет, годный только для него. Форма намеренно та же, что у SSO_ASSERT_KEYS.
-# Пусто НЕ экспортируем: при недоступном шлюзе лучше остаться на legacy-секрете,
-# чем поднять SSO, который не узнаёт ни один сайт.
+# Частичную или пустую сборку не экспортируем и завершаем bootstrap:
+# активный SSO обязан знать каждый host из конфигурационной карты.
 INTERNAL_MAP="$(fetch_config sso_internal_secrets)"
 if [ -n "$INTERNAL_MAP" ] && [ -n "$MT" ]; then
   INTERNAL_SECRETS="$(SECGW="$SECGW" MT="$MT" python3 - "$INTERNAL_MAP" <<'PY' 2>/dev/null || true
@@ -109,14 +137,7 @@ raw = sys.argv[1]
 try:
     mapping = json.loads(raw)
 except Exception:
-    # config-store отдаёт значение ОБЪЕКТОМ, а _val() печатает python-repr с ОДИНАРНЫМИ
-    # кавычками — это не JSON. Молча получить пустую карту здесь опасно:
-    # после отключения legacy это означало бы 403 на ВСЕХ сайтах.
-    try:
-        import ast
-        mapping = ast.literal_eval(raw)
-    except Exception:
-        mapping = {}
+    mapping = {}
 secgw = os.environ["SECGW"]; mt = os.environ["MT"]
 out = {}
 for host, secname in (mapping.items() if isinstance(mapping, dict) else []):
@@ -133,13 +154,117 @@ for host, secname in (mapping.items() if isinstance(mapping, dict) else []):
 print(json.dumps(out))
 PY
 )"
-  if [ -n "$INTERNAL_SECRETS" ] && [ "$INTERNAL_SECRETS" != "{}" ]; then
+  if [ -n "$INTERNAL_SECRETS" ] && [ "$INTERNAL_SECRETS" != "{}" ] && \
+    INTERNAL_MAP="$INTERNAL_MAP" INTERNAL_SECRETS="$INTERNAL_SECRETS" python3 - <<'PY'
+import json
+import os
+import sys
+
+try:
+    expected_raw = json.loads(os.environ["INTERNAL_MAP"])
+    actual_raw = json.loads(os.environ["INTERNAL_SECRETS"])
+except Exception:
+    raise SystemExit(1)
+
+def normalized_keys(mapping):
+    if not isinstance(mapping, dict) or not mapping:
+        raise SystemExit(1)
+    keys = []
+    for host, value in mapping.items():
+        if (
+            not isinstance(host, str)
+            or not host.strip()
+            or not isinstance(value, str)
+            or not value
+        ):
+            raise SystemExit(1)
+        keys.append(host.strip().lower())
+    if len(keys) != len(set(keys)):
+        raise SystemExit(1)
+    return set(keys)
+
+if normalized_keys(expected_raw) != normalized_keys(actual_raw):
+    raise SystemExit(1)
+PY
+  then
     export SSO_INTERNAL_SECRETS="$INTERNAL_SECRETS"
     echo "sso-cfg: SSO_INTERNAL_SECRETS <- secrets-gateway×config-store ($(printf %s "$INTERNAL_SECRETS" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))') хостов)" >&2
   else
-    echo "sso-cfg: SSO_INTERNAL_SECRETS пуст — остаёмся на legacy INTERNAL_SECRET" >&2
+    echo "FATAL: SSO_INTERNAL_SECRETS собран не полностью" >&2
+    exit 1
   fi
 fi
+
+# Не запускаем живой SSO в частично сконфигурированном состоянии. systemd
+# перезапустит unit после восстановления gateway; до этого nginx останется
+# fail-closed, но не получит ложный active с 500 от Clerk. Проверяем не только
+# наличие, но и форму access/internal maps: "{}" и malformed JSON здесь равны
+# отсутствию, иначе auth/check либо даст 500, либо свалится в небезопасный fallback.
+python3 - <<'PY'
+import json
+import os
+import sys
+
+errors = []
+required = (
+    "JWT_SECRET",
+    "CLERK_SECRET_KEY",
+    "VPS_SSO_DB_URL",
+    "COOKIE_DOMAIN",
+    "SSO_HOST",
+    "ALLOWED_REDIRECT_HOSTS",
+)
+for name in required:
+    if not os.environ.get(name, "").strip():
+        errors.append(f"{name} missing")
+
+redirect_raw = os.environ.get("ALLOWED_REDIRECT_HOSTS", "")
+redirect_hosts = [host.strip() for host in redirect_raw.split(",")]
+if redirect_raw.strip() and any(not host for host in redirect_hosts):
+    errors.append("ALLOWED_REDIRECT_HOSTS contains an empty host")
+
+def load_object(name):
+    raw = os.environ.get(name, "")
+    try:
+        value = json.loads(raw)
+    except Exception:
+        errors.append(f"{name} malformed JSON")
+        return None
+    if not isinstance(value, dict) or not value:
+        errors.append(f"{name} must be a non-empty object")
+        return None
+    return value
+
+access = load_object("SSO_ACCESS")
+if access is not None:
+    for email, hosts in access.items():
+        if not isinstance(email, str) or not email.strip():
+            errors.append("SSO_ACCESS has an empty/non-string email")
+            break
+        if (
+            not isinstance(hosts, list)
+            or not hosts
+            or any(not isinstance(host, str) or not host.strip() for host in hosts)
+        ):
+            errors.append(f"SSO_ACCESS[{email!r}] must be a non-empty string array")
+            break
+
+internal = load_object("SSO_INTERNAL_SECRETS")
+if internal is not None:
+    for host, secret in internal.items():
+        if (
+            not isinstance(host, str)
+            or not host.strip()
+            or not isinstance(secret, str)
+            or not secret
+        ):
+            errors.append("SSO_INTERNAL_SECRETS must map non-empty hosts to non-empty strings")
+            break
+
+if errors:
+    print("FATAL: invalid required boot configuration: " + "; ".join(errors), file=sys.stderr)
+    raise SystemExit(1)
+PY
 
 # 4) Next standalone НЕ кладёт .next/static (и public) в свою папку, а сервер
 # отдаёт /_next/static/* из своего CWD (.next/standalone). Без линка все чанки =

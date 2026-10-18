@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "oxlint -c .oxlintrc.json .",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
-    "test": "vitest run"
+    "test": "vitest run && bash tests/run-launcher-guard.sh"
   },
   "dependencies": {
     "@clerk/nextjs": "^6",
