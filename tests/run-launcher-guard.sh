@@ -10,6 +10,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# run.sh по умолчанию зовёт node по прод-пути VPS; в тесте — тот node, что есть в PATH.
+node_bin="$(command -v node)" || { echo "FAIL: node не найден в PATH"; exit 1; }
+
 prepare_case() {
   local name="$1" case_dir="$tmp_dir/$1"
   mkdir -p "$case_dir/.next/standalone"
@@ -36,6 +39,7 @@ invoke() {
     env -i \
       HOME="$tmp_dir" \
       PATH="$PATH" \
+      SSO_NODE_BIN="$node_bin" \
       "$@" \
       timeout 20 bash "$case_dir/run.sh" 2>&1
   )"
@@ -119,6 +123,15 @@ if [ "$rc" -ne 0 ]; then
   printf '%s\n' "$output"
   exit 1
 fi
+
+# Нет node по заданному пути — явный отказ лаунчера, а не «No such file» от exec.
+prepare_case missing-node
+set +e
+output="$(env -i HOME="$tmp_dir" PATH="$PATH" SSO_NODE_BIN="$tmp_dir/no-such-node" \
+  timeout 20 bash "$tmp_dir/missing-node/run.sh" 2>&1)"
+rc=$?
+set -e
+expect_failure missing-node "FATAL: node не найден"
 
 fake_bin="$tmp_dir/fake-bin"
 credentials="$tmp_dir/credentials"
