@@ -9,7 +9,8 @@ import { checkInternalSecret, normalizeHost } from '@/lib/internalSecret'
 // LIVE source: config-store (defaults/sso_access), fetched on demand with a
 // short TTL cache — editing the map takes effect WITHOUT restarting SSO.
 // Fallback: env SSO_ACCESS (snapshot injected by run.sh) when config-store is
-// unreachable; then the flat ALLOWED_EMAILS allowlist.
+// unreachable; then an explicit flat ALLOWED_EMAILS allowlist. With none of the
+// three available we DENY: no map must never mean "everyone everywhere".
 // ---------------------------------------------------------------------------
 
 function parseAccess(obj: unknown): Map<string, Set<string>> | null {
@@ -75,7 +76,9 @@ async function accessMap(): Promise<Map<string, Set<string>> | null> {
   return map
 }
 
-// Flat allowlist (backwards-compatible). Empty/unset ⇒ any authenticated user.
+// Flat allowlist (backwards-compatible, service-agnostic). Empty/unset ⇒ nobody:
+// it is only consulted when the access map is unavailable, and an outage of the
+// map must fail closed rather than open every host to every Clerk account.
 function allowedEmails(): Set<string> {
   return new Set(
     (process.env.ALLOWED_EMAILS ?? '')
@@ -93,9 +96,16 @@ async function isAllowed(email: string, host: string): Promise<boolean> {
     if (!hosts) return false
     return hosts.has('*') || hosts.has(host)
   }
-  // Fallback: flat allowlist, service-agnostic.
+  // Fallback: flat allowlist, service-agnostic. Empty ⇒ deny (fail closed).
   const allow = allowedEmails()
-  return allow.size === 0 || allow.has(email)
+  if (allow.size === 0) {
+    console.error(
+      `[access-map-unavailable] deny host=${host}: config-store fetch failed and ` +
+        'SSO_ACCESS snapshot is missing/malformed, ALLOWED_EMAILS unset',
+    )
+    return false
+  }
+  return allow.has(email)
 }
 
 // Machine token check (LEGACY JWT-svc path, kept for dual-accept during the
