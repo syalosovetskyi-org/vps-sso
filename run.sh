@@ -273,4 +273,12 @@ PY
 # Симлинки .next/standalone/{.next/static,public} делает deploy/prepare.sh (ExecStartPre=+, root):
 # под непривилегированным пользователем дерево только для чтения.
 cd .next/standalone
-exec /usr/local/lib/nodejs/v22.22.3/bin/node server.js
+# Путь к node — прод-значение по умолчанию; SSO_NODE_BIN переопределяет его там, где node
+# стоит иначе (CI-раннер, машина разработчика). Раньше путь был зашит, и тест лаунчера
+# проходил только на VPS: CI главной ветки был красным с 18.10 (serg/tasks#3045).
+NODE_BIN="${SSO_NODE_BIN:-/usr/local/lib/nodejs/v22.22.3/bin/node}"
+if [ ! -x "$NODE_BIN" ]; then
+  echo "FATAL: node не найден: $NODE_BIN (задай SSO_NODE_BIN)" >&2
+  exit 1
+fi
+exec "$NODE_BIN" server.js
